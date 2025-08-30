@@ -1,0 +1,11 @@
+requests
+opencv-python
+google-generativeai
+pycocotools
+torch
+Pillow
+matplotlib
+transformers
+numpy
+tqdm
+moondream
