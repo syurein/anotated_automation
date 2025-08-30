@@ -4,8 +4,6 @@ import random
 import requests
 import cv2
 
-from google import genai
-
 from pycocotools.coco import COCO  # インストール済みであることが前提
 import torch
 from PIL import Image, ImageDraw, ImageFont
@@ -366,52 +364,56 @@ class GroundingDINOHFInference:
         print(f"--- 処理完了 ---")
         print(f"YOLO形式のアノテーションファイルが '{output_folder_path}' に保存されました。")
 
+import os
+import json
+from PIL import Image
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+from tqdm import tqdm
+
+
+
 class MoondreamInference:
     def __init__(self, api_key=None):
-        if api_key is None:
-            api_key = userdata.get('moondream')
-        self.model = md.vl(api_key=api_key)
+        # デバイスの設定（GPUが利用可能ならGPUを使う）
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"使用デバイス: {self.device}")
+
+        # モデルとトークナイザーの読み込み
+        model_id = "vikhyatk/moondream2"
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            revision="2025-06-21",
+            trust_remote_code=True,
+            device_map="auto",
+            torch_dtype=torch.float16
+        ).to(self.device)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
     def get_response(self, image_path, prompt):
-        """
-        COCOEvaluator は get_response を呼ぶので、
-        ここで Moondream の detect を内部で呼び、結果を JSON文字列で返す
-        """
-        image = Image.open(image_path)
-        # Moondream's detect expects a single string or a list of strings for categories.
-        # Your original code: `cat = list(prompt)` and `list(cat)[0]` might lead to issues
-        # if prompt is not a simple string. Assuming prompt is a single category string.
-        category_to_detect = prompt # Assuming prompt is directly the category name, like "cat" or "dog"
-        print(f"Moondream detecting: {category_to_detect}")
-        result = self.model.detect(image, category_to_detect)
-        # Moondream はすでに dict なので JSON にして返す
+        """画像とプロンプトから物体検出結果を取得"""
+        image = Image.open(image_path).convert('RGB')
+        result = self.model.detect(image, prompt)
         return json.dumps(result["objects"])
 
     def parse_response(self, resp_text):
-        """
-        get_response で返した JSON文字列をパースし、
-        Gemini と同じ形式の list[dict] に揃える
-        """
-
+        """生の応答をパースして標準化された形式に変換"""
         detections = json.loads(resp_text)
         parsed = []
         for obj in detections:
             parsed.append({
-                "label": obj.get("label", "object"),  # ない場合もあるかも
+                "label": obj.get("label", "object"),
                 "box_2d": [
                     obj["y_min"], obj["x_min"],
                     obj["y_max"], obj["x_max"]
                 ]
             })
-            print(parsed)
         return parsed
+
     def create_yolo_dataset(self, image_folder_path, output_folder_path, class_mapping, prompt=None):
-        """
-        指定されたフォルダ内の全画像に対して推論を行い、YOLO形式の学習データを作成する。
-        内部で自身の get_response と parse_response を呼び出す。
-        """
+        """YOLO形式のデータセットを作成"""
         os.makedirs(output_folder_path, exist_ok=True)
-        
+
         supported_formats = ('.jpg', '.jpeg', '.png')
         image_files = [f for f in os.listdir(image_folder_path) if f.lower().endswith(supported_formats)]
 
@@ -420,11 +422,10 @@ class MoondreamInference:
             return
 
         class_names = ", ".join(f"'{name}'" for name in class_mapping.keys())
-        if prompt == None:
+        if prompt is None:
             prompt = (f"Detect all prominent items from the following list: {class_names} in the image. "
                       "The response should be a JSON array. Each object should have a 'label' and 'box_2d'. "
                       "The box_2d should be [ymin, xmin, ymax, xmax] normalized to 0-1000.")
-           
 
         print(f"--- YOLOデータセット作成開始 ({self.__class__.__name__}) ---")
         print(f"使用するプロンプト: {prompt}")
@@ -435,18 +436,15 @@ class MoondreamInference:
             output_txt_path = os.path.join(output_folder_path, f"{base_filename}.txt")
 
             try:
-                # 自身の推論メソッドを呼び出す
                 raw_response = self.get_response(image_path, prompt)
                 detections = self.parse_response(raw_response)
 
                 yolo_lines = []
                 for det in detections:
                     label = det.get('label', '').lower()
-                    
                     if label in class_mapping:
                         class_id = class_mapping[label]
                         box_2d = det.get('box_2d')
-
                         if box_2d and len(box_2d) == 4:
                             x_center, y_center, w, h = _convert_to_yolo_format(box_2d)
                             yolo_lines.append(f"{class_id} {x_center:.6f} {y_center:.6f} {w:.6f} {h:.6f}")
@@ -459,13 +457,18 @@ class MoondreamInference:
 
         print(f"--- 処理完了 ---")
         print(f"YOLO形式のアノテーションファイルが '{output_folder_path}' に保存されました。")
-
 class GeminiInference:
     """
     Gemini API 呼び出しを扱うクラス。
     """
-    def __init__(self, api_key_source=userdata.get('gemini')):
+    def __init__(self, api_key_source=None):
         self.api_key_source = api_key_source
+        if api_key_source is None and IS_COLAB:
+            try:
+                from google.colab import userdata
+                self.api_key_source = userdata.get('gemini')
+            except (ImportError, NameError):
+                print("警告: Colab環境で 'gemini' のAPIキーが取得できませんでした。")
 
     def get_response(self, file_path, prompt):
         """
