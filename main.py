@@ -13,7 +13,7 @@ if __name__ == '__main__':
     # ダウンロードしたい画像のカテゴリ
     COCO_CATEGORY = 'person'
     # ダウンロードする画像の枚数
-    NUM_IMAGES = 300
+    NUM_IMAGES = 10
 
     # --- 2. YOLOアノテーション作成設定 ---
     # 生成されるYOLO形式のラベルファイルを保存するディレクトリ

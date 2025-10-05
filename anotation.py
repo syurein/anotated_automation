@@ -287,7 +287,7 @@ class GroundingDINOHFInference:
         results = self.processor.post_process_grounded_object_detection(
             outputs=outputs,
             input_ids=inputs.input_ids,
-             threshold=0.3,
+            #threshold=0.3,
             target_sizes=[image.size[::-1]] # target_sizes expects (height, width)
         )
         # 複数返るが今回は1枚画像なので最初のリストを返します
