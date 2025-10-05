@@ -273,9 +273,11 @@ class GroundingDINOHFInference:
         image = Image.open(image_path).convert("RGB")
         # 文末にピリオドが推奨されます :contentReference[oaicite:1]{index=1}
         if prompt in 'all':
-          text=prompt
+          
+          text = f"{prompt[prompt.find('all ')+3:prompt.find(' in')]}."#特殊パターンのプロンプトのみここで対応
         else:
-          text = f"{prompt[prompt.find('all ')+3:prompt.find(' in')]}."
+          text=prompt #普通パターン
+        #ここが逆だった
         print(text)
         self.width,self.height=image.size # PIL Image.size returns (width, height)
         inputs = self.processor(images=image, text=text, return_tensors="pt",max_length=128).to(self.device)
