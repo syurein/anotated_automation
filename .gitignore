@@ -1,3 +1,9 @@
 main/
 coco_data/
 yolo_labels/
+test_dino/
+train_dino/
+__pycache__/
+venv/
+training_data/
+data/
