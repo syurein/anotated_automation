@@ -37,8 +37,8 @@ class DINOv2Classifier(nn.Module):
         super(DINOv2Classifier, self).__init__()
         self.dinov2 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
         
-        for param in self.dinov2.parameters():
-            param.requires_grad = False
+        """ for param in self.dinov2.parameters():
+            param.requires_grad = False """
             
         feature_dim = self.dinov2.embed_dim
         self.linear_head = nn.Linear(feature_dim, num_classes)
@@ -123,9 +123,16 @@ def train_and_save_model(support_dataset):
     support_loader = DataLoader(support_dataset, batch_size=16, shuffle=True)
     
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.linear_head.parameters(), lr=1e-3)
-    
-    num_epochs = 40 
+    #optimizer = optim.Adam(model.linear_head.parameters(), lr=1e-3)
+    optimizer=optim.AdamW([{'params': model.linear_head.parameters(), 'lr': 1e-3},{'params': model.dinov2.parameters(), 'lr': 1e-6}])
+    num_epochs = 60 
+    # 2. 重みファイルからstate_dictを読み込む
+    model_path = 'dinov2_custom_classifier_head.pth'  # DINOv2の事前学習済みモデルのパス
+    pretrained_dict = torch.load(model_path)
+
+    # 3. モデルに重みを適用する
+    model.load_state_dict(pretrained_dict, strict=False)
+
     model.train()
     for epoch in range(num_epochs):
         running_loss = 0.0
