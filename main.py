@@ -5,6 +5,7 @@ from anotation import (
     prepare_coco_annotations,
     COCOHandler
 )
+import dotenv
 import random
 
 if __name__ == '__main__':

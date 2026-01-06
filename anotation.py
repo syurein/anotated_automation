@@ -261,6 +261,169 @@ class KosmosInference:
         print(f"--- 処理完了 ---")
         print(f"YOLO形式のアノテーションファイルが '{output_folder_path}' に保存されました。")
 
+
+import os
+import time
+import json
+import requests
+from PIL import Image
+from tqdm import tqdm
+
+
+class DINOXInference:
+    def __init__(self, api_token, device=None):
+        """
+        DINO-X API用の推論クラス
+        :param api_token: DINO-X Platformのアクセストークン
+        """
+        self.api_token = api_token
+        self.base_url = "https://api.deepdataspace.com/v2"
+        self.headers = {
+            "Token": self.api_token
+        }
+        # API版ではローカルのdevice(cuda/cpu)は使用しませんが、インターフェース維持のため保持
+        self.device = device 
+
+    def get_response(self, image_path, prompt):
+        """
+        DINO-X APIを呼び出し、タスクが完了するまで待機して結果を返す
+        """
+        # 画像サイズ取得（正規化用）
+        with Image.open(image_path) as img:
+            self.width, self.height = img.size
+
+        # --- Step 1: タスク作成 ---
+        # APIのパスはドキュメントに基づき 'dinox/detection' とします
+        task_url = f"{self.base_url}/task/dinox/detection"
+        
+        # ※ファイルアップロードが必要なため、multipart/form-dataで送信します
+        # プロンプトなどのパラメータは 'data' フィールドに含めます
+        payload = {
+            "text_prompt": prompt,
+        }
+        
+        with open(image_path, 'rb') as f:
+            files = {'image': f}
+            resp = requests.post(task_url, headers=self.headers, data=payload, files=files)
+        
+        if resp.status_code != 200:
+            raise Exception(f"Task creation failed: {resp.text}")
+            
+        json_resp = resp.json()
+        if json_resp.get("code") != 0:
+            raise Exception(f"API Error: {json_resp.get('msg')}")
+            
+        task_uuid = json_resp["data"]["task_uuid"]
+
+        # --- Step 2: ポーリング (結果が success か failed になるまで待機) ---
+        status_url = f"{self.base_url}/task_status/{task_uuid}"
+        
+        while True:
+            status_resp = requests.get(status_url, headers=self.headers)
+            status_data = status_resp.json()
+            
+            if status_data.get("code") != 0:
+                raise Exception(f"Status check failed: {status_data.get('msg')}")
+                
+            status = status_data["data"]["status"]
+            
+            if status == "success":
+                # 成功したら結果を返す
+                return status_data["data"]["result"]
+            elif status == "failed":
+                raise Exception(f"Task failed: {status_data['data'].get('error')}")
+            
+            # 1秒待機して再試行
+            time.sleep(1)
+
+    def parse_response(self, resp):
+        """
+        APIのレスポンスを共通フォーマット [ymin, xmin, ymax, xmax] (0-1) に変換
+        """
+        parsed = []
+        # DINO-X APIの一般的なレスポンス形式を想定（objectsキー配下にリスト）
+        # ※実際のAPIのJSON構造に合わせて調整が必要な場合があります
+        objects = resp.get("objects", [])
+
+        for obj in objects:
+            label = obj.get("category", "")
+            # APIが返す座標系が [xmin, ymin, xmax, ymax] のピクセル値であると仮定
+            bbox = obj.get("bbox", [0, 0, 0, 0])
+            xmin, ymin, xmax, ymax = bbox
+
+            # === 必ず 0〜1 に正規化 ===
+            ymin_norm = ymin / self.height
+            xmin_norm = xmin / self.width
+            ymax_norm = ymax / self.height
+            xmax_norm = xmax / self.width
+
+            parsed.append({
+                "label": label,
+                "box_2d": [ymin_norm, xmin_norm, ymax_norm, xmax_norm]
+            })
+        
+        return parsed
+
+    def create_yolo_dataset(self, image_folder_path, output_folder_path, class_mapping, prompt=None):
+        """
+        指定されたフォルダ内の全画像に対してAPI推論を行い、YOLO形式の学習データを作成する
+        """
+        os.makedirs(output_folder_path, exist_ok=True)
+        
+        supported_formats = ('.jpg', '.jpeg', '.png')
+        image_files = [f for f in os.listdir(image_folder_path) if f.lower().endswith(supported_formats)]
+
+        if not image_files:
+            print(f"警告: '{image_folder_path}' に画像ファイルが見つかりません。")
+            return
+
+        class_names = ", ".join(f"'{name}'" for name in class_mapping.keys())
+        if prompt is None:
+            # DINO-Xはより自然な英語を理解するため、プロンプトをシンプルに構成
+            prompt = f"Detect {class_names}."
+
+        print(f"--- YOLOデータセット作成開始 ({self.__class__.__name__}) ---")
+        print(f"使用するプロンプト: {prompt}")
+
+        for filename in tqdm(image_files, desc=f"Processing images with {self.__class__.__name__}"):
+            image_path = os.path.join(image_folder_path, filename)
+            base_filename = os.path.splitext(filename)[0]
+            output_txt_path = os.path.join(output_folder_path, f"{base_filename}.txt")
+
+            try:
+                # API推論を実行
+                raw_response = self.get_response(image_path, prompt)
+                detections = self.parse_response(raw_response)
+
+                yolo_lines = []
+                for det in detections:
+                    label = det.get('label', '').lower()
+                    
+                    if label in class_mapping:
+                        class_id = class_mapping[label]
+                        box_2d = det.get('box_2d')
+
+                        if box_2d and len(box_2d) == 4:
+                            x_center, y_center, w, h = _convert_to_yolo_format(box_2d)
+                            yolo_lines.append(f"{class_id} {x_center:.6f} {y_center:.6f} {w:.6f} {h:.6f}")
+
+                with open(output_txt_path, 'w') as f:
+                    f.write("\n".join(yolo_lines))
+
+            except Exception as e:
+                print(f"エラー: ファイル '{filename}' の処理中に問題が発生しました: {e}")
+
+        print(f"--- 処理完了 ---")
+        print(f"YOLO形式のアノテーションファイルが '{output_folder_path}' に保存されました。")
+
+
+
+
+
+
+
+
+
 class GroundingDINOHFInference:
 
     def __init__(self, model_id="IDEA-Research/grounding-dino-base", device=None):
