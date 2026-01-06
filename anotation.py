@@ -373,6 +373,125 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 from tqdm import tqdm
 
+# --- Moondream3Inference クラスの定義 ---
+class Moondream3Inference:
+    def __init__(self):
+        # デバイスの設定
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"使用デバイス: {self.device}")
+
+        # モデルの読み込み (Moondream3-preview)
+        print("Moondream3モデルを読み込んでいます...")
+        model_id = "moondream/moondream3-preview"
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            device_map={"": self.device},
+            torch_dtype=torch.float16
+        )
+        
+        try:
+            print("モデルをコンパイル中...")
+            self.model.compile()
+        except Exception as e:
+            print(f"コンパイルをスキップしました: {e}")
+
+    def create_yolo_dataset(self, image_folder_path, output_folder_path, class_mapping, prompt=None, visualize=False):
+        """
+        YOLO形式のデータセットを作成
+        
+        Args:
+            visualize (bool): Trueにすると、バウンディングボックスを描画した画像を保存します。
+        """
+        os.makedirs(output_folder_path, exist_ok=True)
+        
+        # 可視化用の保存フォルダを作成
+        vis_output_dir = os.path.join(output_folder_path, "visualized")
+        if visualize:
+            os.makedirs(vis_output_dir, exist_ok=True)
+
+        supported_formats = ('.jpg', '.jpeg', '.png')
+        image_files = [f for f in os.listdir(image_folder_path) if f.lower().endswith(supported_formats)]
+
+        if not image_files:
+            print(f"警告: '{image_folder_path}' に画像ファイルが見つかりません。")
+            return
+
+        print(f"--- YOLOデータセット作成開始 (Moondream3) ---")
+        if visualize:
+            print(f"Info: バウンディングボックス画像の保存が有効です -> '{vis_output_dir}'")
+
+        for filename in tqdm(image_files, desc="Processing images"):
+            image_path = os.path.join(image_folder_path, filename)
+            base_filename = os.path.splitext(filename)[0]
+            output_txt_path = os.path.join(output_folder_path, f"{base_filename}.txt")
+            
+            yolo_lines = []
+
+            try:
+                # 画像を開く
+                image = Image.open(image_path).convert('RGB')
+                img_w, img_h = image.size # 画像サイズ取得（描画用）
+                
+                # 描画モードの準備
+                draw = None
+                if visualize:
+                    draw = ImageDraw.Draw(image)
+
+                # class_mappingに登録されている各ラベルについて検出を実行
+                for label_name, class_id in class_mapping.items():
+                    result = self.model.detect(image, label_name)
+                    objects = result.get("objects", [])
+
+                    for obj in objects:
+                        # Moondream3は 0.0〜1.0 の正規化座標を返す
+                        x_min_norm = obj['x_min']
+                        y_min_norm = obj['y_min']
+                        x_max_norm = obj['x_max']
+                        y_max_norm = obj['y_max']
+
+                        # --- YOLO形式の計算 ---
+                        w_norm = x_max_norm - x_min_norm
+                        h_norm = y_max_norm - y_min_norm
+                        x_center = x_min_norm + (w_norm / 2)
+                        y_center = y_min_norm + (h_norm / 2)
+
+                        # クリップ
+                        x_center = max(0, min(1, x_center))
+                        y_center = max(0, min(1, y_center))
+                        w_norm = max(0, min(1, w_norm))
+                        h_norm = max(0, min(1, h_norm))
+
+                        yolo_lines.append(f"{class_id} {x_center:.6f} {y_center:.6f} {w_norm:.6f} {h_norm:.6f}")
+
+                        # --- 可視化用（描画） ---
+                        if visualize and draw:
+                            # ピクセル座標に変換
+                            x1 = x_min_norm * img_w
+                            y1 = y_min_norm * img_h
+                            x2 = x_max_norm * img_w
+                            y2 = y_max_norm * img_h
+                            
+                            # 赤い枠線を描画
+                            draw.rectangle([x1, y1, x2, y2], outline="red", width=3)
+                            # オプション：クラス名を描画したければ以下を追加
+                            # draw.text((x1, y1), label_name, fill="red")
+
+                # YOLOテキストファイル書き出し
+                with open(output_txt_path, 'w') as f:
+                    if yolo_lines:
+                        f.write("\n".join(yolo_lines))
+                
+                # 可視化画像の保存
+                if visualize:
+                    save_path = os.path.join(vis_output_dir, filename)
+                    image.save(save_path)
+
+            except Exception as e:
+                print(f"エラー: ファイル '{filename}' の処理中に問題が発生しました: {e}")
+
+        print(f"--- 処理完了 ---")
+        print(f"YOLO形式のアノテーションファイルが '{output_folder_path}' に保存されました。")
 
 
 class MoondreamInference:

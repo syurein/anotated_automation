@@ -1,6 +1,7 @@
 import os
 from anotation import (
-    GroundingDINOHFInference,
+    Moondream3Inference,
+    MoondreamInference,
     prepare_coco_annotations,
     COCOHandler
 )
@@ -63,13 +64,13 @@ if __name__ == '__main__':
     print(f"画像のダウンロードが完了しました。保存先: {IMAGE_DIR}")
 
     # --- 手順C: YOLOデータセットの作成 ---
-    print("\n--- GroundingDINOによるYOLOデータセット作成を開始します ---")
+    print("\n--- Moondream3によるYOLOデータセット作成を開始します ---")
 
-    # GroundingDINOモデルのインスタンスを初期化
-    grounding_dino = GroundingDINOHFInference()
+    # Moondream3モデルのインスタンスを初期化
+    moondream3 = Moondream3Inference()
 
     # ダウンロードした画像を使ってYOLOデータセットを作成
-    grounding_dino.create_yolo_dataset(
+    moondream3.create_yolo_dataset(
         image_folder_path=IMAGE_DIR,
         output_folder_path=OUTPUT_DIR,
         class_mapping=CLASS_MAPPING,
