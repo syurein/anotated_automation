@@ -565,78 +565,78 @@ def _convert_to_yolo_format(box_2d):
     
     return x_center, y_center, w, h
 
+import torch
+import os
+import json
+from PIL import Image
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM
+
 class Moondream3Inference:
     def __init__(self, api_key=None):
         # デバイスの設定
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"使用デバイス: {self.device}")
+        print(f"使用デバイス: {self.device} (Full Precision Mode)")
 
-        # モデルの読み込み (Moondream3-preview)
+        # モデルの読み込み (量子化なし / float16)
         print("Moondream3モデルを読み込んでいます...")
         model_id = "moondream/moondream3-preview"
+        
         self.model = AutoModelForCausalLM.from_pretrained(
             model_id,
             trust_remote_code=True,
-            device_map={"": self.device},
-            torch_dtype=torch.float16
+            device_map={"": self.device} if torch.cuda.is_available() else None,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
         )
         
-        # 【修正箇所】Moondream3ではAutoTokenizer.from_pretrainedでエラーが出るため
-        # モデルに紐付いているtokenizerを直接参照します
+        # モデルに紐付いているtokenizerを参照
         if hasattr(self.model, "tokenizer"):
             self.tokenizer = self.model.tokenizer
         else:
-            # tokenizer属性がない場合はNoneにする（推論自体はmodel.detect内で完結するため）
             self.tokenizer = None
 
+        # GPUパワーがあるため、コンパイルも試行（推論を高速化）
         try:
-            print("モデルをコンパイル中...")
-            # 注意: 環境によっては compile() が不安定な場合があります
-            self.model.compile()
+            if torch.cuda.is_available():
+                print("モデルをコンパイルして推論を最適化しています...")
+                self.model.compile()
         except Exception as e:
-            print(f"コンパイルをスキップしました: {e}")
+            print(f"コンパイルをスキップしました (非対応環境など): {e}")
 
     def get_response(self, image_path, prompt):
         """
-        画像とプロンプトから物体検出結果を取得
+        アンサンブル評価スクリプトから呼び出されるメソッド。
+        推論結果をJSON文字列で返します。
         """
         image = Image.open(image_path).convert('RGB')
         
-        # プロンプトの中に 'list: ' というキーワードがあれば、その後のラベルを抽出
-        labels = []
-        if "list:" in prompt:
-            try:
-                # 'list: ' 以降の部分を取得し、カンマで分割してクリーンアップ
-                list_part = prompt.split("list:")[1].split("in the image")[0]
-                labels = [l.strip().replace("'", "").replace('"', '') for l in list_part.split(",")]
-            except:
-                labels = [prompt]
-        else:
-            labels = [prompt]
+        # プロンプトから検出対象を抽出（例: "Detect all persons." -> "person"）
+        target = "person" if "person" in prompt.lower() else prompt
+        
+        # 推論実行
+        with torch.inference_mode():
+            result = self.model.detect(image, target)
+        
+        objects = result.get("objects", [])
+        
+        # 各オブジェクトにラベル名を付与（parse_responseで使用）
+        for obj in objects:
+            obj["label"] = target.lower()
 
-        all_objects = []
-        for label in labels:
-            # Moondream3の検出実行
-            # model.detect は内部でエンコード処理を行うため tokenizer を明示的に呼ぶ必要はありません
-            result = self.model.detect(image, label)
-            objects = result.get("objects", [])
-            for obj in objects:
-                obj["label"] = label.lower()
-                all_objects.append(obj)
-
-        return json.dumps(all_objects)
+        return json.dumps(objects)
 
     def parse_response(self, resp_text):
         """
-        生の応答（JSON文字列）をパースして標準化された [ymin, xmin, ymax, xmax] 形式に変換
+        get_response のJSON出力を受け取り、共通フォーマットに変換。
+        出力形式: [{'label': str, 'box_2d': [ymin, xmin, ymax, xmax]}] (0.0 - 1.0)
         """
         detections = json.loads(resp_text)
         parsed = []
         for obj in detections:
             # Moondream3: x_min, y_min, x_max, y_max
-            # 出力形式を Moondream2 互換の [ymin, xmin, ymax, xmax] に合わせる
+            # 評価スクリプト期待形式: [ymin, xmin, ymax, xmax]
             parsed.append({
-                "label": obj.get("label", "object"),
+                "label": obj.get("label", "person"),
                 "box_2d": [
                     obj["y_min"], obj["x_min"],
                     obj["y_max"], obj["x_max"]
@@ -646,10 +646,9 @@ class Moondream3Inference:
 
     def create_yolo_dataset(self, image_folder_path, output_folder_path, class_mapping, prompt=None):
         """
-        YOLO形式のデータセットを作成
+        フォルダ内の画像を処理してYOLO形式の学習データを作成する独立メソッド
         """
         os.makedirs(output_folder_path, exist_ok=True)
-
         supported_formats = ('.jpg', '.jpeg', '.png')
         image_files = [f for f in os.listdir(image_folder_path) if f.lower().endswith(supported_formats)]
 
@@ -657,44 +656,32 @@ class Moondream3Inference:
             print(f"警告: '{image_folder_path}' に画像ファイルが見つかりません。")
             return
 
-        class_names = ", ".join(f"'{name}'" for name in class_mapping.keys())
-        if prompt is None:
-            prompt = (f"Detect all prominent items from the following list: {class_names} in the image. "
-                      "The response should be a JSON array. Each object should have a 'label' and 'box_2d'. "
-                      "The box_2d should be [ymin, xmin, ymax, xmax] normalized to 0-1.")
-
-        print(f"--- YOLOデータセット作成開始 ({self.__class__.__name__}) ---")
-        print(f"使用するプロンプト: {prompt}")
-
-        for filename in tqdm(image_files, desc=f"Processing images with {self.__class__.__name__}"):
+        print(f"--- YOLOデータセット作成開始 (Moondream3) ---")
+        for filename in tqdm(image_files, desc="Processing images"):
             image_path = os.path.join(image_folder_path, filename)
             base_filename = os.path.splitext(filename)[0]
             output_txt_path = os.path.join(output_folder_path, f"{base_filename}.txt")
 
             try:
-                raw_response = self.get_response(image_path, prompt)
-                detections = self.parse_response(raw_response)
+                # 既存のロジックを再利用
+                raw = self.get_response(image_path, prompt or "person")
+                detections = self.parse_response(raw)
 
                 yolo_lines = []
                 for det in detections:
                     label = det.get('label', '').lower()
                     if label in class_mapping:
                         class_id = class_mapping[label]
-                        box_2d = det.get('box_2d')
-                        if box_2d and len(box_2d) == 4:
-                            x_center, y_center, w, h = _convert_to_yolo_format(box_2d)
-                            yolo_lines.append(f"{class_id} {x_center:.6f} {y_center:.6f} {w:.6f} {h:.6f}")
+                        # 外部で定義されている _convert_to_yolo_format を利用
+                        xc, yc, w, h = _convert_to_yolo_format(det['box_2d'])
+                        yolo_lines.append(f"{class_id} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}")
 
                 with open(output_txt_path, 'w') as f:
-                    if yolo_lines:
-                        f.write("\n".join(yolo_lines))
-
+                    f.write("\n".join(yolo_lines))
             except Exception as e:
-                print(f"エラー: ファイル '{filename}' の処理中に問題が発生しました: {e}")
+                print(f"エラー: {filename} の処理中に問題が発生しました: {e}")
 
         print(f"--- 処理完了 ---")
-        print(f"YOLO形式のアノテーションファイルが '{output_folder_path}' に保存されました。")
-
 class MoondreamInference:
     def __init__(self, api_key=None):
         # デバイスの設定（GPUが利用可能ならGPUを使う）
